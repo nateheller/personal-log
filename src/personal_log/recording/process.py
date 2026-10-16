@@ -38,8 +38,19 @@ class RecorderConfig:
     fault_delay: float = 0.5
     fault_after: int = 1
     synthetic_speed: float = 1.0
+    capture_source: str = 'fake'
+    input_device: int | None = None
+    input_device_name: str | None = None
+    input_host_api: str | None = None
 
     def __post_init__(self):
+        if self.capture_source not in {'fake', 'microphone'}:
+            raise ValueError('Unknown capture source')
+        if self.capture_source == 'microphone':
+            if type(self.input_device) is not int or self.input_device < 0 or not self.input_device_name or not self.input_host_api:
+                raise ValueError('Explicit microphone index, name, and host API required')
+            if self.synthetic_speed != 1 or self.capture_fail_at is not None:
+                raise ValueError('Synthetic pacing/failure controls cannot alter microphone capture')
         for value in (self.block_seconds, self.grace_seconds, self.drain_seconds, self.windows_seconds,
                       self.operation_timeout, self.worker_timeout, self.startup_timeout, self.fault_delay, self.synthetic_speed):
             if not math.isfinite(value) or value <= 0:
@@ -169,7 +180,7 @@ def _supervisor(ready, repository, root, owner, token, config, emergency):
                         startup_failed = True
                         break
                     if event.get("message"):
-                        reject(event["message"], "storage_failed")
+                        reject(event["message"], event["reason"])
                     stop(event["reason"], now)
                 elif kind == "stopped":
                     live_state = event["state"]

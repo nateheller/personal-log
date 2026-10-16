@@ -11,7 +11,8 @@ import queue
 import threading
 import time
 
-from .fake import AudioBlock, AudioFormat, FakeMicrophone
+from .fake import AudioBlock, AudioFormat
+from .microphone import create_capture
 from .ipc import JsonChannel, digest, status
 from personal_log.storage.files import DurableIO
 from personal_log.storage.segments import PersistenceError, SegmentStore
@@ -53,6 +54,8 @@ def _storage_loop(tasks, results, shared, deadline, config, repository, root, ow
     current_sid = None
 
     def guard():
+        if shared.get('capture_error'):
+            raise PersistenceError('Capture loss prevents successful finalization')
         stopping = deadline[0]
         if stopping is not None and (stopping[0] != "normal_shutdown" or time.monotonic() >= stopping[1]):
             raise PersistenceError("Finish interrupted before commit")
@@ -74,6 +77,7 @@ def _storage_loop(tasks, results, shared, deadline, config, repository, root, ow
                             shared["written"] += task["block"].frames
                             shared["accounted"] += task["block"].frames
                         except Exception:
+                            shared['capture_error'] = 'storage_failed'
                             try:
                                 shared["accounted"] = store.db.execute(
                                     "SELECT coalesce(sum(t.accepted_frames),0) FROM segment_storage t "
@@ -85,6 +89,8 @@ def _storage_loop(tasks, results, shared, deadline, config, repository, root, ow
                     continue
                 if kind == "stop":
                     reason = deadline[0][0] if deadline[0] is not None else task["reason"]
+                    if shared.get('capture_error') and reason == 'normal_shutdown':
+                        reason = shared['capture_error']
                     message = task.get("message")
                     response = _reply(message, "finished" if reason == "normal_shutdown" else "interrupted") if message else None
                     receipt = (lambda: store.remember_command(message, response)) if message and current_sid else None
@@ -114,6 +120,11 @@ def _storage_loop(tasks, results, shared, deadline, config, repository, root, ow
                                 code = "buffered_capture_gap" if shared["accounting_exact"] else "capture_intent_unconfirmed"
                                 severity = "gap" if shared["accounting_exact"] else "uncertain"
                                 _finding(store, current_sid, None, code, severity, missing=gap)
+                        if shared.get('capture_detail'):
+                            from personal_log.storage.recovery import _finding
+                            with store.transaction('capture_failure'):
+                                _finding(store, current_sid, None, shared['capture_detail'],
+                                         'uncertain' if shared.get('unknown_loss') else 'error')
                     else:
                         existing = "idle"
                     if response:
@@ -168,7 +179,10 @@ def _storage_loop(tasks, results, shared, deadline, config, repository, root, ow
                 try:
                     if action == "record":
                         current_sid, interval = store.begin_session(audio_format=AudioFormat(sample_rate=config.sample_rate),
-                            entry_id=payload.get("entry_id"), session_id=sid, receipt=receipt)
+                            entry_id=payload.get("entry_id"), session_id=sid, receipt=receipt,
+                            device_id='synthetic' if config.capture_source == 'fake' else json.dumps({
+                                'backend': 'portaudio', 'index': config.input_device,
+                                'name': config.input_device_name, 'host_api': config.input_host_api}, sort_keys=True))
                         writer = store.writer(current_sid, interval)
                         shared["written"] = shared["attempted"] = shared["accounted"] = 0
                         shared["accounting_exact"] = True
@@ -207,7 +221,7 @@ def worker_main(sock, config, repository, root, owner):
     next_capture = next_tick = time.monotonic()
     stopping = False
     task_saturated = False
-    pending_fault = False
+    pending_fault = None
     pending_stop = None
     stop_enqueued = False
     frozen = False
@@ -225,8 +239,40 @@ def worker_main(sock, config, repository, root, owner):
                 if capture and capture.running:
                     capture.stop()
                 task_saturated = True
-                pending_fault = True
+                shared['capture_error'] = 'storage_failed'
+                pending_fault = 'storage_failed'
             return False
+
+    def stop_capture():
+        """Join callback activity, then put its accepted prefix before a barrier."""
+        nonlocal capturing, interval_position, pending_fault, task_saturated
+        capturing = False
+        if capture is None:
+            return
+        capture.stop()
+        if config.capture_source == 'microphone':
+            shared['captured'] = capture.position
+            while (raw := capture.read(block_frames)) is not None:
+                block = AudioBlock(interval_position, raw.frames, raw.pcm)
+                if enqueue_task({'type': 'audio', 'block': block}):
+                    interval_position += raw.frames
+                else:
+                    break  # Remaining bounded buffer is represented by capture-gap accounting.
+            if capture.error:
+                shared['capture_error'] = 'capture_failed'
+                shared['capture_detail'] = capture.error
+                shared['unknown_loss'] = capture.unknown_loss
+                pending_fault = 'capture_failed'
+                task_saturated = True  # Never execute a success barrier after source failure.
+
+    def capture_fault(message=None):
+        nonlocal pending_fault, task_saturated
+        shared['capture_error'] = 'capture_failed'
+        task_saturated = True
+        stop_capture()
+        pending_fault = 'capture_failed'
+        if message:
+            channel.queue({'type': 'fault', 'reason': 'capture_failed', 'message': message})
 
     while True:
         now = time.monotonic()
@@ -236,9 +282,7 @@ def worker_main(sock, config, repository, root, owner):
             elif incoming["type"] == "stop":
                 reason, stop_deadline = incoming["reason"], incoming["deadline"]
                 deadline[0] = (reason, stop_deadline)
-                capturing = False
-                if capture and capture.running:
-                    capture.stop()
+                stop_capture()
                 stopping = True
                 if not stop_enqueued:
                     pending_stop = incoming  # One bounded slot, behind accepted FIFO audio.
@@ -254,11 +298,10 @@ def worker_main(sock, config, repository, root, owner):
                     continue
                 action = result["action"]
                 if action in {"pause", "finish"}:
-                    capturing = False
-                    if capture and capture.running:
-                        capture.stop()
+                    stop_capture()
                     state = "pausing" if action == "pause" else "finalizing"
-                enqueue_task({"type": "execute", **{k: result[k] for k in ("message", "action")}})
+                if not task_saturated:
+                    enqueue_task({"type": "execute", **{k: result[k] for k in ("message", "action")}})
             elif result["type"] == "response":
                 if not result["replayed"]:
                     action = result["action"]
@@ -266,18 +309,28 @@ def worker_main(sock, config, repository, root, owner):
                         state = result["response"]["payload"]["state"]
                         sid = result["response"]["session_id"]
                     if action in {"record", "resume"} and not stopping and not task_saturated:
-                        if action == "record":
-                            capture = FakeMicrophone(AudioFormat(sample_rate=config.sample_rate), fail_at_frame=config.capture_fail_at)
-                            shared["captured"] = 0
-                        capture.start()
-                        interval_position = 0
-                        next_capture = now + config.block_seconds / config.synthetic_speed
-                        capturing = True
+                        try:
+                            if action == "record":
+                                capture = create_capture(config)
+                                shared["captured"] = 0
+                            capture.start()
+                            interval_position = 0
+                            next_capture = now + config.block_seconds / config.synthetic_speed
+                            capturing = True
+                        except Exception:
+                            capture_fault()
+                            # Durable Record/Resume receipt is historical metadata;
+                            # do not forward success when the device failed to start.
+                            rejected = {**result['response'], 'payload': {
+                                **result['response']['payload'], 'state': 'interrupted',
+                                'code': 'rejected', 'error_code': 'capture_failed'}}
+                            channel.queue({'type': 'response', 'response': rejected, 'replayed': True})
+                            continue
                 channel.queue(result)
             elif result["type"] == "fault":
-                capturing = False
-                if capture and capture.running:
-                    capture.stop()
+                shared['capture_error'] = result['reason']
+                task_saturated = True
+                stop_capture()
                 channel.queue(result)
             elif result["type"] == "stopped":
                 state = result["state"]
@@ -286,29 +339,31 @@ def worker_main(sock, config, repository, root, owner):
         if pending_stop is not None and enqueue_task(pending_stop, fault_on_full=False):
             pending_stop = None
             stop_enqueued = True
-        if pending_fault and channel.queue({"type": "fault", "reason": "storage_failed"}):
-            pending_fault = False
-        if capturing and now >= next_capture:
+        if capturing and capture.failure():
+            capture_fault()
+        if pending_fault and channel.queue({"type": "fault", "reason": pending_fault}):
+            pending_fault = None
+        if capturing and (config.capture_source == 'microphone' or now >= next_capture):
             if tasks.qsize() >= config.queue_blocks:
-                capturing = False
-                capture.stop()
-                channel.queue({"type": "fault", "reason": "storage_failed"})
+                shared['capture_error'] = 'storage_failed'
+                stop_capture()
+                task_saturated = True
+                pending_fault = 'storage_failed'
             else:
                 try:
                     raw = capture.read(block_frames)
-                    block = AudioBlock(interval_position, raw.frames, raw.pcm)
-                    shared["captured"] += raw.frames
-                    if not enqueue_task({"type": "audio", "block": block}):
-                        continue  # Read frames remain accounted as an unrepresented gap.
-                    interval_position += raw.frames
-                    next_capture = now + raw.frames / config.sample_rate / config.synthetic_speed
-                    if (not frozen and config.fault_boundary == "worker_loop" and config.fault_mode == "block"
-                            and shared["captured"] >= 10):
-                        frozen = True
-                        threading.Event().wait()  # Synthetic whole-loop stall.
+                    if raw is not None:
+                        block = AudioBlock(interval_position, raw.frames, raw.pcm)
+                        shared["captured"] = capture.position
+                        if enqueue_task({"type": "audio", "block": block}):
+                            interval_position += raw.frames
+                            next_capture = now + raw.frames / config.sample_rate / config.synthetic_speed
+                        if (not frozen and config.fault_boundary == "worker_loop" and config.fault_mode == "block"
+                                and shared["captured"] >= 10):
+                            frozen = True
+                            threading.Event().wait()  # Synthetic whole-loop stall.
                 except Exception:
-                    capturing = False
-                    channel.queue({"type": "fault", "reason": "capture_failed"})
+                    capture_fault()
         if now >= next_tick:
             channel.queue({"type": "tick", "state": state, "session_id": sid,
                            "captured": shared["captured"], "written": shared["written"]})

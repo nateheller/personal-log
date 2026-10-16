@@ -21,3 +21,7 @@ Increment 2 segment persistence, recovery ordering, and durability limits:
 
 Increment 3A process control, IPC, shutdown policy, and limitations:
 `docs/MILESTONE_1_INCREMENT_3A.md`.
+
+Opt-in Windows microphone adapter and explicit PowerShell manual testing:
+`docs/MILESTONE_1_MICROPHONE.md`. Install `.[microphone]` only for manual device use;
+automated tests use simulated devices and never open a real microphone.

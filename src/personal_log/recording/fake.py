@@ -27,10 +27,13 @@ class AudioBlock:
 
 class Capture(Protocol):
     format: AudioFormat
+    running: bool
+    position: int
 
     def start(self) -> None: ...
-    def read(self, frames: int) -> AudioBlock: ...
+    def read(self, frames: int) -> AudioBlock | None: ...
     def stop(self) -> None: ...
+    def failure(self) -> str | None: ...
 
 
 class CaptureFailure(RuntimeError):
@@ -60,6 +63,9 @@ class FakeMicrophone:
 
     def stop(self) -> None:
         self.running = False
+
+    def failure(self) -> str | None:
+        return None
 
     def read(self, frames: int) -> AudioBlock:
         if not self.running:

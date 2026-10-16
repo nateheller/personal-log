@@ -401,10 +401,16 @@ def test_unowned_and_malformed_commands_do_not_renew_lease(external, checkout):
         while time.monotonic() < until and recorder.process.is_alive():
             message = recorder.make_command("heartbeat")
             message["payload"]["controller_id"] = str(uuid4())
-            recorder.send(message)
             invalid = recorder.make_command("heartbeat")
             invalid["schema_version"] = 99
-            recorder.send(invalid)
+            try:
+                recorder.send(message)
+                recorder.send(invalid)
+            except ConnectionError:
+                # Expiry can close the channel while the supervisor is still
+                # alive flushing its final status. The durable reason below
+                # remains the assertion that invalid traffic did not renew it.
+                break
             recorder.poll()
             time.sleep(.03)
         await_exit(recorder, timeout=2)

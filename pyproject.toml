@@ -12,6 +12,7 @@ dependencies = ["jsonschema>=4"]
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 desktop = ["PySide6>=6.7"]
+microphone = ["sounddevice>=0.5.1,<0.6"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

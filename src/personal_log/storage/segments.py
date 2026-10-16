@@ -86,7 +86,7 @@ class SegmentStore:
                         (str(uuid4()), session_id, sequence, self.clock(), state, code))
 
     def begin_session(self, *, audio_format: AudioFormat | None = None, entry_id: str | None = None,
-                      session_id: str | None = None, receipt=None) -> tuple[str, str]:
+                      session_id: str | None = None, receipt=None, device_id: str = 'synthetic') -> tuple[str, str]:
         """Create disposable metadata; supplying an entry ID adds a supplement."""
         fmt = audio_format or AudioFormat()
         session_id, interval_id = session_id or str(uuid4()), str(uuid4())
@@ -96,8 +96,8 @@ class SegmentStore:
                 self.db.execute("INSERT INTO journal_entries (entry_id,created_at,display_timezone) VALUES (?,?,'UTC')", (entry_id, self.clock()))
             self.db.execute("INSERT INTO recording_sessions (session_id,entry_id,created_at,state) VALUES (?,?,?,'starting')",
                             (session_id, entry_id, self.clock()))
-            self.db.execute("INSERT INTO capture_intervals (interval_id,session_id,sequence,started_at,device_id,sample_rate,channels,sample_width) VALUES (?,?,0,?,'synthetic',?,1,2)",
-                            (interval_id, session_id, self.clock(), fmt.sample_rate))
+            self.db.execute("INSERT INTO capture_intervals (interval_id,session_id,sequence,started_at,device_id,sample_rate,channels,sample_width) VALUES (?,?,0,?,?,?,1,2)",
+                            (interval_id, session_id, self.clock(), device_id, fmt.sample_rate))
             self.state(session_id, "recording")
             if receipt:
                 receipt()
