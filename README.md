@@ -15,3 +15,6 @@ Build crash-resistant segmented recording with synthetic/disposable audio and au
 See `docs/ROADMAP.md` and `AGENTS.md`.
 
 Increment 1 contracts, shutdown policy, and limitations: `docs/MILESTONE_1_INCREMENT_1.md`.
+
+Increment 2 segment persistence, recovery ordering, and durability limits:
+`docs/MILESTONE_1_INCREMENT_2.md`.

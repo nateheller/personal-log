@@ -8,18 +8,20 @@ import sqlite3
 from .paths import data_file, prepare_data_root
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
-def _migration_sql() -> str:
-    return files(__package__).joinpath("migrations/001_recording.sql").read_text(encoding="utf-8")
+def _migration_sql(version: int = 1) -> str:
+    names = {1: "001_recording.sql", 2: "002_segment_persistence.sql"}
+    return files(__package__).joinpath("migrations/" + names[version]).read_text(encoding="utf-8")
 
 
-def _inspect_schema(connection: sqlite3.Connection, digest: str) -> int:
+def _inspect_schema(connection: sqlite3.Connection) -> int:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version == SCHEMA_VERSION:
+    if 0 < version <= SCHEMA_VERSION:
         rows = connection.execute("SELECT version, sha256 FROM schema_migrations ORDER BY version").fetchall()
-        if rows != [(SCHEMA_VERSION, digest)]:
+        expected = [(n, sha256(_migration_sql(n).encode("utf-8")).hexdigest()) for n in range(1, version + 1)]
+        if rows != expected:
             raise RuntimeError("Migration history differs from this application")
         return version
     if version != 0:
@@ -37,20 +39,20 @@ def migrate(connection: sqlite3.Connection) -> None:
     """
     if connection.in_transaction:
         raise RuntimeError("Migration requires an idle connection")
-    sql = _migration_sql()
-    digest = sha256(sql.encode("utf-8")).hexdigest()
-    if _inspect_schema(connection, digest) == SCHEMA_VERSION:
-        return
-    try:
-        connection.executescript(
-            "BEGIN IMMEDIATE;\n" + sql
-            + f"\nINSERT INTO schema_migrations VALUES (1, '{digest}');"
-            + "\nPRAGMA user_version = 1;\nCOMMIT;"
-        )
-    except BaseException:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
+    version = _inspect_schema(connection)
+    for number in range(version + 1, SCHEMA_VERSION + 1):
+        sql = _migration_sql(number)
+        digest = sha256(sql.encode("utf-8")).hexdigest()
+        try:
+            connection.executescript(
+                "BEGIN IMMEDIATE;\n" + sql
+                + f"\nINSERT INTO schema_migrations VALUES ({number}, '{digest}');"
+                + f"\nPRAGMA user_version = {number};\nCOMMIT;"
+            )
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
 
 
 def open_database(*, repository: Path, root: Path | None = None) -> sqlite3.Connection:
@@ -62,7 +64,7 @@ def open_database(*, repository: Path, root: Path | None = None) -> sqlite3.Conn
     try:
         connection.execute("PRAGMA foreign_keys = ON")
         # Inspect version/history before changing persistence settings.
-        _inspect_schema(connection, sha256(_migration_sql().encode("utf-8")).hexdigest())
+        _inspect_schema(connection)
         if connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] != "wal":
             raise RuntimeError("WAL mode unavailable")
         connection.execute("PRAGMA synchronous = FULL")

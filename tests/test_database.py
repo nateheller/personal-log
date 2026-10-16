@@ -37,7 +37,7 @@ def db(external, checkout):
 def test_schema_reopen_and_durability_settings(external, checkout):
     root = external / "data"
     db = database.open_database(repository=checkout, root=root)
-    assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert db.execute("PRAGMA user_version").fetchone()[0] == database.SCHEMA_VERSION
     assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert db.execute("PRAGMA synchronous").fetchone()[0] == 2
     assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
@@ -199,13 +199,13 @@ def test_job_uniqueness_and_leases(db):
 
 def test_failed_migration_rolls_back_ddl_and_version(external, monkeypatch):
     db = sqlite3.connect(external / "failed.sqlite3", isolation_level=None)
-    original = database._migration_sql()
-    monkeypatch.setattr(database, "_migration_sql", lambda: original + "\nINVALID SQL;")
+    original = database._migration_sql
+    monkeypatch.setattr(database, "_migration_sql", lambda version=1: original(version) + "\nINVALID SQL;")
     with pytest.raises(sqlite3.OperationalError):
         database.migrate(db)
     assert db.execute("PRAGMA user_version").fetchone()[0] == 0
     assert db.execute("SELECT name FROM sqlite_master").fetchall() == []
-    monkeypatch.setattr(database, "_migration_sql", lambda: original)
+    monkeypatch.setattr(database, "_migration_sql", original)
     database.migrate(db)
     db.close()
 
@@ -219,8 +219,8 @@ db = sqlite3.connect(sys.argv[1], isolation_level=None)
 db.execute('PRAGMA journal_mode=WAL')
 db.execute('PRAGMA synchronous=FULL')
 db.create_function('crash', 0, lambda: os._exit(77))
-original = database._migration_sql()
-database._migration_sql = lambda: original + '\\nSELECT crash();'
+original = database._migration_sql
+database._migration_sql = lambda version=1: original(version) + '\\nSELECT crash();'
 database.migrate(db)
 """
     result = subprocess.run([sys.executable, "-c", script, str(path)], capture_output=True, text=True, timeout=20)
@@ -230,7 +230,7 @@ database.migrate(db)
     assert db.execute("PRAGMA user_version").fetchone()[0] == 0
     assert db.execute("SELECT name FROM sqlite_master").fetchall() == []
     database.migrate(db)
-    assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert db.execute("PRAGMA user_version").fetchone()[0] == database.SCHEMA_VERSION
     db.close()
 
 
