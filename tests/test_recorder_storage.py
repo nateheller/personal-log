@@ -92,5 +92,5 @@ def test_v3_migration_failure_preserves_complete_v2(external, monkeypatch):
     assert db.execute("SELECT name FROM sqlite_master WHERE name='recorder_commands'").fetchall() == []
     monkeypatch.setattr(database, "_migration_sql", original)
     database.migrate(db)
-    assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert db.execute("PRAGMA user_version").fetchone()[0] == database.SCHEMA_VERSION
     db.close()

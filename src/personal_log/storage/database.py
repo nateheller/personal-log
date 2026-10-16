@@ -8,15 +8,28 @@ import sqlite3
 from .paths import data_file, prepare_data_root
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _migration_sql(version: int = 1) -> str:
-    names = {1: "001_recording.sql", 2: "002_segment_persistence.sql", 3: "003_recorder_commands.sql"}
+    names = {1: "001_recording.sql", 2: "002_segment_persistence.sql", 3: "003_recorder_commands.sql",
+             4: "004_transcription.sql"}
     return files(__package__).joinpath("migrations/" + names[version]).read_text(encoding="utf-8")
 
 
 def _inspect_schema(connection: sqlite3.Connection) -> int:
+    # Version and checksum rows must come from the same read snapshot while
+    # another connection may be committing a numbered upgrade.
+    if connection.in_transaction:
+        return _inspect_schema_snapshot(connection)
+    connection.execute('BEGIN')
+    try:
+        return _inspect_schema_snapshot(connection)
+    finally:
+        connection.rollback()
+
+
+def _inspect_schema_snapshot(connection: sqlite3.Connection) -> int:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
     if 0 < version <= SCHEMA_VERSION:
         rows = connection.execute("SELECT version, sha256 FROM schema_migrations ORDER BY version").fetchall()
@@ -44,11 +57,26 @@ def migrate(connection: sqlite3.Connection) -> None:
         sql = _migration_sql(number)
         digest = sha256(sql.encode("utf-8")).hexdigest()
         try:
-            connection.executescript(
-                "BEGIN IMMEDIATE;\n" + sql
-                + f"\nINSERT INTO schema_migrations VALUES ({number}, '{digest}');"
-                + f"\nPRAGMA user_version = {number};\nCOMMIT;"
-            )
+            connection.execute('BEGIN IMMEDIATE')
+            # A different recorder/processor may have upgraded while we waited.
+            # Recheck history under the write lock before executing any DDL.
+            current = _inspect_schema(connection)
+            if current >= number:
+                connection.commit()
+                continue
+            if current != number - 1:
+                raise RuntimeError('Unexpected migration ordering')
+            statement = ''
+            for line in sql.splitlines(keepends=True):
+                statement += line
+                if sqlite3.complete_statement(statement):
+                    connection.execute(statement)
+                    statement = ''
+            if statement.strip():
+                connection.execute(statement)
+            connection.execute('INSERT INTO schema_migrations VALUES (?,?)', (number, digest))
+            connection.execute(f'PRAGMA user_version = {number}')
+            connection.commit()
         except BaseException:
             if connection.in_transaction:
                 connection.rollback()
