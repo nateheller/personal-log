@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Personal Log journal entry (provisional)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "entry_id",
+    "created_at",
+    "segments"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.1"
+    },
+    "entry_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "segments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "segment_id",
+          "created_at"
+        ],
+        "properties": {
+          "segment_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}
