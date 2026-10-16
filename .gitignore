@@ -13,6 +13,7 @@ __pycache__/
 *.log
 .env*
 !*.example
+*.egg-info/
 /private/
 /data/
 /recordings/
