@@ -81,8 +81,8 @@ class ControlLease:
     """Recorder-owned policy; times are finite monotonic seconds, never wall time.
 
     Missing heartbeats allow 10 seconds from the last acknowledged heartbeat.
-    Once stopping is latched, late heartbeats cannot restart recording. Runtime
-    enforcement and a process watchdog are intentionally a later increment.
+    Once stopping is latched, late heartbeats cannot restart recording. The
+    recording.process supervisor provides runtime enforcement independently of I/O.
     """
 
     last_heartbeat: float

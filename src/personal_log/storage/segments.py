@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from hashlib import sha256
 import os
+import json
 from pathlib import Path
 import sqlite3
 from uuid import UUID, uuid4
@@ -59,13 +60,15 @@ class SegmentStore:
         self._lock.close()
 
     @contextmanager
-    def transaction(self, label: str):
+    def transaction(self, label: str, guard=None):
         if self.db.in_transaction:
             raise RuntimeError("Nested storage transactions are not supported")
         self.db.execute("BEGIN IMMEDIATE")
         try:
             yield
             self.io.hook(label + ".before_commit")
+            if guard is not None:
+                guard()
             self.db.commit()
             self.io.hook(label + ".committed")
         except BaseException:
@@ -82,10 +85,11 @@ class SegmentStore:
         self.db.execute("INSERT INTO lifecycle_events (event_id,session_id,sequence,created_at,state,code) VALUES (?,?,?,?,?,?)",
                         (str(uuid4()), session_id, sequence, self.clock(), state, code))
 
-    def begin_session(self, *, audio_format: AudioFormat | None = None, entry_id: str | None = None) -> tuple[str, str]:
+    def begin_session(self, *, audio_format: AudioFormat | None = None, entry_id: str | None = None,
+                      session_id: str | None = None, receipt=None) -> tuple[str, str]:
         """Create disposable metadata; supplying an entry ID adds a supplement."""
         fmt = audio_format or AudioFormat()
-        session_id, interval_id = str(uuid4()), str(uuid4())
+        session_id, interval_id = session_id or str(uuid4()), str(uuid4())
         with self.transaction("session_start"):
             if entry_id is None:
                 entry_id = str(uuid4())
@@ -95,7 +99,58 @@ class SegmentStore:
             self.db.execute("INSERT INTO capture_intervals (interval_id,session_id,sequence,started_at,device_id,sample_rate,channels,sample_width) VALUES (?,?,0,?,'synthetic',?,1,2)",
                             (interval_id, session_id, self.clock(), fmt.sample_rate))
             self.state(session_id, "recording")
+            if receipt:
+                receipt()
         return session_id, interval_id
+
+    def remember_command(self, message: dict, response: dict):
+        if not self.db.in_transaction:
+            raise RuntimeError("Command receipts require a transaction")
+        digest = sha256(json.dumps(message, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        payload = message["payload"]
+        self.db.execute("INSERT INTO recorder_commands VALUES (?,?,?,?,?,?)",
+                        (message["message_id"], payload["controller_id"], payload["sequence"],
+                         message["session_id"], digest, json.dumps(response, sort_keys=True)))
+
+    def enqueue(self, session_id: str):
+        if not self.db.in_transaction:
+            raise RuntimeError("Enqueue requires the Finish transaction")
+        revision = self.db.execute("SELECT input_revision FROM recording_sessions WHERE session_id=?", (session_id,)).fetchone()[0]
+        self.db.execute("INSERT INTO processing_jobs (job_id,session_id,created_at,job_type,input_revision,pipeline_version,state) "
+                        "VALUES (?,?,?,'process_session',?,'capture-v1','pending') "
+                        "ON CONFLICT(session_id,input_revision,job_type,pipeline_version) DO NOTHING",
+                        (str(uuid4()), session_id, self.clock(), revision))
+
+    def resume_session(self, session_id: str, *, receipt=None) -> str:
+        previous = self.db.execute("SELECT * FROM capture_intervals WHERE session_id=? ORDER BY sequence DESC LIMIT 1", (session_id,)).fetchone()
+        interval_id = str(uuid4())
+        with self.transaction("session_resume"):
+            self.state(session_id, "resuming")
+            self.db.execute("INSERT INTO capture_intervals (interval_id,session_id,sequence,started_at,device_id,sample_rate,channels,sample_width) VALUES (?,?,?,?,?,?,1,2)",
+                            (interval_id, session_id, previous["sequence"] + 1, self.clock(), previous["device_id"], previous["sample_rate"]))
+            self.state(session_id, "recording")
+            if receipt:
+                receipt()
+        return interval_id
+
+    def finish_paused(self, session_id: str, *, receipt=None, guard=None):
+        with self.transaction("session_finish", guard):
+            self.state(session_id, "finalizing")
+            self.state(session_id, "finished")
+            self.db.execute("UPDATE recording_sessions SET recovery_status='clean' WHERE session_id=?", (session_id,))
+            self.enqueue(session_id)
+            if receipt:
+                receipt()
+
+    def interrupt(self, session_id: str, reason: str):
+        with self.transaction("session_interrupt"):
+            state = self.db.execute("SELECT state FROM recording_sessions WHERE session_id=?", (session_id,)).fetchone()[0]
+            if state == "finished":
+                return  # Durable Finish already linearized before interruption.
+            self.db.execute("UPDATE recording_sessions SET interruption_code=? WHERE session_id=?", (reason, session_id))
+            if state != "recovery_required":
+                self.state(session_id, "interrupted", reason)
+            self.db.execute("UPDATE capture_intervals SET ended_at=?,end_reason=? WHERE session_id=? AND ended_at IS NULL", (self.clock(), reason, session_id))
 
     def writer(self, session_id: str, interval_id: str):
         if any(not w.closed for w in self._writers):
@@ -284,19 +339,48 @@ class SegmentWriter:
         self.sequence += 1
         self.segment_id = None
 
-    def finish(self) -> list[dict]:
+    def pause(self, *, receipt=None):
         if self.closed:
             raise PersistenceError("Writer is closed")
         try:
             if self.fd is not None:
                 self._finalize()
-            with self.store.transaction("session_finish"):
+            with self.store.transaction("session_pause"):
+                self.store.state(self.session_id, "pausing")
+                self.store.db.execute("UPDATE capture_intervals SET ended_at=?,end_reason='pause' WHERE interval_id=?", (self.store.clock(), self.interval_id))
+                self.store.state(self.session_id, "paused")
+                if receipt:
+                    receipt()
+            self.closed = True
+        except Exception as error:
+            self._fail()
+            raise PersistenceError("Pause failed; recovery required") from error
+
+    def preserve_interruption(self, reason: str):
+        try:
+            if not self.closed and self.fd is not None:
+                self._finalize()
+            self.store.interrupt(self.session_id, reason)
+        finally:
+            self.abandon()
+
+    def finish(self, *, enqueue=False, receipt=None, guard=None, return_references=True) -> list[dict]:
+        if self.closed:
+            raise PersistenceError("Writer is closed")
+        try:
+            if self.fd is not None:
+                self._finalize()
+            with self.store.transaction("session_finish", guard):
                 self.store.state(self.session_id, "finalizing")
                 self.store.db.execute("UPDATE capture_intervals SET ended_at=?,end_reason='finish' WHERE interval_id=?", (self.store.clock(), self.interval_id))
                 self.store.state(self.session_id, "finished")
                 self.store.db.execute("UPDATE recording_sessions SET recovery_status='clean' WHERE session_id=?", (self.session_id,))
+                if enqueue:
+                    self.store.enqueue(self.session_id)
+                if receipt:
+                    receipt()
             self.closed = True
-            return self.store.segments(self.session_id)
+            return self.store.segments(self.session_id) if return_references else []
         except Exception as error:
             self._fail()
             raise PersistenceError("Recording was not acknowledged as saved") from error

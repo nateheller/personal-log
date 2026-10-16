@@ -1,4 +1,4 @@
-"""SQLite schema bootstrap only; no recording writer or job executor yet."""
+"""Numbered metadata migrations and configured connections; no job executor."""
 
 from hashlib import sha256
 from importlib.resources import files
@@ -8,11 +8,11 @@ import sqlite3
 from .paths import data_file, prepare_data_root
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _migration_sql(version: int = 1) -> str:
-    names = {1: "001_recording.sql", 2: "002_segment_persistence.sql"}
+    names = {1: "001_recording.sql", 2: "002_segment_persistence.sql", 3: "003_recorder_commands.sql"}
     return files(__package__).joinpath("migrations/" + names[version]).read_text(encoding="utf-8")
 
 

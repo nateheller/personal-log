@@ -392,7 +392,7 @@ def test_v1_upgrade_preserves_existing_metadata_and_failed_v2_rolls_back(externa
     assert db.execute("SELECT name FROM sqlite_master WHERE name='segment_storage'").fetchall() == []
     monkeypatch.setattr(database, "_migration_sql", original)
     database.migrate(db)
-    assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert db.execute("PRAGMA user_version").fetchone()[0] == database.SCHEMA_VERSION
     assert db.execute("SELECT count(*) FROM recording_sessions").fetchone()[0] == 1
     db.close()
 

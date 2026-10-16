@@ -18,3 +18,6 @@ Increment 1 contracts, shutdown policy, and limitations: `docs/MILESTONE_1_INCRE
 
 Increment 2 segment persistence, recovery ordering, and durability limits:
 `docs/MILESTONE_1_INCREMENT_2.md`.
+
+Increment 3A process control, IPC, shutdown policy, and limitations:
+`docs/MILESTONE_1_INCREMENT_3A.md`.
