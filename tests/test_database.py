@@ -138,6 +138,46 @@ def test_append_only_events(db):
     assert db.execute("SELECT state FROM lifecycle_events").fetchall() == [("starting",)]
 
 
+@pytest.mark.parametrize("failure", ["duplicate_sequence", "invalid_code"])
+def test_failed_lifecycle_event_rolls_back_state_change(db, failure):
+    insert(db, "lifecycle_events", event_id=EVENT, session_id=SESSION, sequence=0,
+           created_at=NOW, state="starting", code="state_changed")
+    with pytest.raises(sqlite3.IntegrityError):
+        # open_database uses autocommit: the context manager alone does not BEGIN.
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE recording_sessions SET state='recording' WHERE session_id=?", (SESSION,))
+            assert db.execute("SELECT state FROM recording_sessions WHERE session_id=?", (SESSION,)).fetchone()[0] == "recording"
+            insert(db, "lifecycle_events", event_id=str(UUID(int=99)), session_id=SESSION,
+                   sequence=0 if failure == "duplicate_sequence" else 1,
+                   created_at=NOW, state="recording",
+                   code="state_changed" if failure == "duplicate_sequence" else "invalid")
+    assert not db.in_transaction
+    # A fresh connection verifies committed state, not just the writer's view.
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    observer = sqlite3.connect(path)
+    try:
+        assert observer.execute("SELECT state FROM recording_sessions WHERE session_id=?", (SESSION,)).fetchone() == ("starting",)
+        assert observer.execute("SELECT event_id, state FROM lifecycle_events").fetchall() == [(EVENT, "starting")]
+    finally:
+        observer.close()
+
+
+def test_state_and_lifecycle_event_commit_together(db):
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("UPDATE recording_sessions SET state='recording' WHERE session_id=?", (SESSION,))
+        insert(db, "lifecycle_events", event_id=EVENT, session_id=SESSION, sequence=0,
+               created_at=NOW, state="recording", code="state_changed")
+    assert not db.in_transaction
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    observer = sqlite3.connect(path)
+    try:
+        assert observer.execute("SELECT s.state, e.state FROM recording_sessions s JOIN lifecycle_events e ON e.session_id=s.session_id WHERE s.session_id=?", (SESSION,)).fetchall() == [("recording", "recording")]
+    finally:
+        observer.close()
+
+
 def job_fields(**overrides):
     fields = dict(job_id=JOB, session_id=SESSION, created_at=NOW, job_type="process_session",
                   input_revision=0, pipeline_version="future-v1", state="blocked")

@@ -134,6 +134,9 @@ class ControlLease:
             # Failure escalates an orderly finish; never extend its existing budget.
             self.reason = reason
         if reason == "windows_shutdown":
-            # Bound by both the existing stop deadline and two seconds from now.
-            self.drain_seconds = min(self.drain_seconds, now + 2.0 - self.stop_at)
+            # Keep the budget relative to the original stop decision, even when
+            # its deadline has passed. Clamp it without extending that deadline;
+            # repeated/late shutdown notices cannot grant more preservation time.
+            elapsed = max(0.0, now - self.stop_at)
+            self.drain_seconds = max(0.0, min(self.drain_seconds, elapsed + 2.0))
         return self.poll(now)

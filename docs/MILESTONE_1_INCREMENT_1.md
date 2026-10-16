@@ -42,6 +42,12 @@ The transition function rejects repeated transitions; a future command dispatche
 must deduplicate command IDs before calling it. The database permits updates that
 leave the state unchanged. Session state and lifecycle events must eventually be
 written in the same transaction by the recording service; no service exists yet.
+The schema supports this without a migration. `open_database` uses autocommit,
+so callers must explicitly `BEGIN` (for example `BEGIN IMMEDIATE`) before the
+state update and event insertion, then commit or roll back both. A connection
+context manager alone does not start a transaction in this configuration. Tests
+verify successful joint commit and rollback after both a duplicate event sequence
+and an invalid event code, including the committed view from a second connection.
 
 ## Control and shutdown policy
 
@@ -49,6 +55,10 @@ All lease decisions use a recorder-owned monotonic clock. Heartbeats are expecte
 once per second; 10 seconds from the last accepted heartbeat is the hard grace
 deadline. Repeated disconnect notices do not reset it. `ControlLease` models these
 decisions deterministically; it has no dependency on UI event-loop progress.
+Windows shutdown bounds preservation by the earlier existing deadline or two
+seconds from notification. The budget remains nonnegative and relative to the
+original stop decision; late or repeated notifications never extend it or revive
+capture after expiry.
 
 | Situation | Required runtime behavior |
 | --- | --- |
@@ -75,6 +85,11 @@ the checkout, UNC paths on Windows, redirected database files/sidecars, and trav
 file names. Never fall back to the working directory. Path checks do not eliminate
 adversarial time-of-check/time-of-use races or detect every cloud-sync, mapped-drive,
 or hard-link arrangement; arbitrary custom production paths are not qualified.
+Windows tests exercise real directory junctions into the checkout, redirected
+ancestors, and aliases at the database and all three SQLite sidecar names. These
+are directory redirection tests, not qualification of actual file symlinks, other
+reparse-point types, or concurrent path replacement. File symlinks and hard links
+are not created by this suite; no additional link privileges are required.
 
 SQLite uses foreign keys, STRICT tables, WAL and synchronous FULL. Versioned SQL
 is bundled as package data; migration DDL, checksum, and user_version are committed

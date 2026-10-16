@@ -72,10 +72,15 @@ def test_regular_file_not_a_data_root(external, checkout):
         prepare_data_root(repository=checkout, root=path)
 
 
-def test_database_sidecar_alias_rejected(external, checkout):
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm", "-journal"])
+def test_database_sidecar_alias_rejected(external, checkout, suffix):
     root = external / "data"
     root.mkdir()
-    directory_alias(root / "recording.sqlite3-wal", checkout)
+    redirected = root / ("recording.sqlite3" + suffix)
+    directory_alias(redirected, checkout)
     with pytest.raises(UnsafeDataPath):
         open_database(repository=checkout, root=root)
-    assert not (root / "recording.sqlite3").exists()
+    if suffix:
+        assert not (root / "recording.sqlite3").exists()
+    else:
+        assert redirected.is_dir()

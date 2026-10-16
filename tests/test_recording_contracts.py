@@ -127,6 +127,39 @@ def test_windows_shutdown_does_not_extend_an_earlier_stop_deadline():
     assert lease.poll(5) == "force_stop"
 
 
+@pytest.mark.parametrize("reason", ["normal_shutdown", "ui_crash", "windows_shutdown", "control_timeout"])
+@pytest.mark.parametrize("elapsed", [0.0, 1.0, 2.0, 4.0, 5.0, 100.0])
+def test_windows_shutdown_after_stop_has_bounded_deterministic_budget(reason, elapsed):
+    def replay():
+        lease = ControlLease(0)
+        if reason == "control_timeout":
+            assert lease.poll(10) == "interrupt"
+        else:
+            lease.shutdown(1, reason)
+        stopped_at = lease.stop_at
+        original_budget = lease.drain_seconds
+        original_deadline = stopped_at + original_budget
+        arrival = stopped_at + elapsed
+
+        action = lease.shutdown(arrival, "windows_shutdown")
+        expected_deadline = min(original_deadline, arrival + 2.0)
+        assert lease.stop_at == stopped_at
+        assert 0 <= lease.drain_seconds <= original_budget
+        assert stopped_at + lease.drain_seconds == expected_deadline
+        assert action == ("force_stop" if arrival >= expected_deadline else "interrupt")
+
+        # Neither duplicate notices nor heartbeats revive an expired decision.
+        assert lease.shutdown(arrival, "windows_shutdown") == action
+        assert stopped_at + lease.drain_seconds == expected_deadline
+        assert not lease.heartbeat(arrival)
+        later = max(arrival, expected_deadline) + 100
+        assert lease.shutdown(later, "windows_shutdown") == "force_stop"
+        assert stopped_at + lease.drain_seconds == expected_deadline
+        return action, lease.stop_at, lease.drain_seconds, lease.reason
+
+    assert replay() == replay()
+
+
 @pytest.mark.parametrize("value", [-1, float("nan"), float("inf")])
 def test_invalid_monotonic_times(value):
     with pytest.raises(ValueError):
